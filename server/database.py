@@ -1,4 +1,9 @@
-"""SQLite persistence layer for the news AI system."""
+"""SQLite persistence layer for the news AI system.
+
+Legacy module-level functions are preserved for backward compatibility during
+migration. New code should use the ``Database`` class from ``db.py`` and the
+Repository layer instead.
+"""
 
 from __future__ import annotations
 
@@ -10,29 +15,48 @@ from typing import Any
 
 import aiosqlite
 
+from db import Database
+from repositories.news import NewsRepository
+
 logger = logging.getLogger(__name__)
 
 DB_PATH = Path(os.getenv("NEWS_AI_DB_PATH", str(Path(__file__).parent / "news_ai.db")))
 
 _db: aiosqlite.Connection | None = None
+_database: Database | None = None
+
+
+async def _get_or_create_database() -> Database:
+    """Return the process-wide Database instance, creating it if needed."""
+    global _database
+    if _database is None:
+        _database = Database(DB_PATH)
+        await _database.connect()
+    return _database
 
 
 async def get_db() -> aiosqlite.Connection:
+    """Return the active SQLite connection (legacy API)."""
     global _db
     if _db is None:
-        _db = await aiosqlite.connect(DB_PATH)
-        _db.row_factory = aiosqlite.Row
-        await _db.execute("PRAGMA journal_mode=WAL")
-        await _db.execute("PRAGMA busy_timeout=5000")
-        await _db.execute("PRAGMA foreign_keys=ON")
+        db = await _get_or_create_database()
+        _db = db.conn
     return _db
 
 
 async def close_db() -> None:
-    global _db
-    if _db is not None:
-        await _db.close()
-        _db = None
+    """Close the active SQLite connection (legacy API)."""
+    global _db, _database
+    if _database is not None:
+        await _database.close()
+        _database = None
+    _db = None
+
+
+async def _news_repo() -> NewsRepository:
+    """Return a NewsRepository backed by the process-wide Database."""
+    db = await _get_or_create_database()
+    return NewsRepository(db)
 
 
 async def init_db() -> None:
@@ -144,125 +168,39 @@ async def init_db() -> None:
 
 
 async def save_news(items: list[dict[str, Any]]) -> None:
-    db = await get_db()
-    await db.execute("DELETE FROM news")
-    for item in items:
-        extra_json = json.dumps(item.get("extra", {}), ensure_ascii=False)
-        await db.execute(
-            """
-            INSERT OR REPLACE INTO news
-                (news_id, title, summary, content, source, url, published_at, extra)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                item["news_id"],
-                item["title"],
-                item.get("summary", ""),
-                item.get("content", ""),
-                item.get("source", ""),
-                item.get("url", ""),
-                item.get("published_at", ""),
-                extra_json,
-            ),
-        )
-    await db.commit()
+    """Legacy news save function."""
+    repo = await _news_repo()
+    await repo.save(items)
 
 
 async def append_news(items: list[dict[str, Any]]) -> None:
-    db = await get_db()
-    for item in items:
-        extra_json = json.dumps(item.get("extra", {}), ensure_ascii=False)
-        await db.execute(
-            """
-            INSERT OR REPLACE INTO news
-                (news_id, title, summary, content, source, url, published_at, extra)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                item["news_id"],
-                item["title"],
-                item.get("summary", ""),
-                item.get("content", ""),
-                item.get("source", ""),
-                item.get("url", ""),
-                item.get("published_at", ""),
-                extra_json,
-            ),
-        )
-    await db.commit()
+    """Legacy news append function."""
+    repo = await _news_repo()
+    await repo.append(items)
 
 
 async def upsert_news(items: list[dict[str, Any]]) -> int:
-    """增量入库：已存在的 news_id 跳过（INSERT OR IGNORE），返回实际新增条数。
-
-    替代 save_news 的"DELETE 全量 + INSERT"写法，避免长跑后写入开销线性增长、
-    以及重复 refresh 导致历史数据被全量重写。调用方负责去重后传入新增条目。
-    """
-    if not items:
-        return 0
-    db = await get_db()
-    inserted = 0
-    for item in items:
-        extra_json = json.dumps(item.get("extra", {}), ensure_ascii=False)
-        cur = await db.execute(
-            """
-            INSERT OR IGNORE INTO news
-                (news_id, title, summary, content, source, url, published_at, extra)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                item["news_id"],
-                item["title"],
-                item.get("summary", ""),
-                item.get("content", ""),
-                item.get("source", ""),
-                item.get("url", ""),
-                item.get("published_at", ""),
-                extra_json,
-            ),
-        )
-        inserted += cur.rowcount
-    await db.commit()
-    return inserted
+    """Legacy incremental news upsert function."""
+    repo = await _news_repo()
+    return await repo.upsert(items)
 
 
 async def update_news_content(news_id: str, content: str) -> None:
-    db = await get_db()
-    await db.execute(
-        "UPDATE news SET content = ? WHERE news_id = ?",
-        (content, news_id),
-    )
-    await db.commit()
+    """Legacy news content update function."""
+    repo = await _news_repo()
+    await repo.update_content(news_id, content)
 
 
 async def clear_news_content_by_source(source: str) -> int:
-    db = await get_db()
-    cursor = await db.execute(
-        "UPDATE news SET content = '' WHERE source = ?",
-        (source,),
-    )
-    await db.commit()
-    return cursor.rowcount
+    """Legacy clear content by source function."""
+    repo = await _news_repo()
+    return await repo.clear_content_by_source(source)
 
 
 async def load_news() -> list[dict[str, Any]]:
-    db = await get_db()
-    cursor = await db.execute("SELECT * FROM news ORDER BY published_at DESC")
-    rows = await cursor.fetchall()
-    result = []
-    for row in rows:
-        item = {
-            "news_id": row["news_id"],
-            "title": row["title"],
-            "summary": row["summary"],
-            "content": row["content"],
-            "source": row["source"],
-            "url": row["url"],
-            "published_at": row["published_at"],
-            "extra": json.loads(row["extra"]) if row["extra"] else {},
-        }
-        result.append(item)
-    return result
+    """Legacy load news function."""
+    repo = await _news_repo()
+    return await repo.load()
 
 
 async def save_article(article: dict[str, Any]) -> None:

@@ -29,10 +29,12 @@ from api.schedule import router as schedule_router
 from api.tasks import router as tasks_router
 from config import (
     CORS_ORIGINS,
+    MEMORY_DB_PATH,
     NEWS_SOURCES,
     NEWSNOW_API_URL,
     SCHEDULE_ENABLED,
 )
+from config.dependencies import get_settings
 from database import (
     close_db,
     init_db,
@@ -41,6 +43,10 @@ from database import (
     load_publish_log,
     upsert_news,
 )
+from db import Database
+from di.container import AppContainer
+from di.state import AppState
+from repositories.news import NewsRepository
 from sources.newsnow import FALLBACK_API_URL, check_newsnow_health
 
 logging.basicConfig(level=logging.DEBUG)
@@ -71,12 +77,35 @@ async def _wait_for_newsnow():
 async def lifespan(app: FastAPI):
     import api.deps as _d
 
+    settings = get_settings()
+    database = Database(settings.news_ai_db_path)
+    await database.connect()
+
+    state = AppState()
+    news_repo = NewsRepository(database)
+    container = AppContainer(
+        settings=settings,
+        database=database,
+        state=state,
+        news_repo=news_repo,
+    )
+
+    app.state.settings = settings
+    app.state.container = container
+
+    # Keep the legacy deps module synchronized with the container state
+    # so existing routers that still import from api.deps continue to work.
+    _d.news_store = state.news_store
+    _d.article_store = state.article_store
+    _d.publish_log = state.publish_log
+    _d.news_lock = state.news_lock
+    _d.article_lock = state.article_lock
+
     await _wait_for_newsnow()
 
     await init_db()
 
     # 初始化记忆数据库
-    from config import MEMORY_DB_PATH
     from core.checkpointer import init_db as init_memory_db
 
     init_memory_db(MEMORY_DB_PATH)
@@ -90,8 +119,8 @@ async def lifespan(app: FastAPI):
             persisted_news = None
 
     if persisted_news:
-        _d.news_store = persisted_news
-        logger.info("Loaded %d news items from DB", len(_d.news_store))
+        state.news_store.extend(persisted_news)
+        logger.info("Loaded %d news items from DB", len(state.news_store))
     else:
         logger.info("Crawling all sources on startup...")
         newsnow_results = await newsnow_batch.crawl_all()
@@ -112,19 +141,19 @@ async def lifespan(app: FastAPI):
         # 增量入库：已存在的 news_id 跳过，避免全量 DELETE+INSERT
         if new_items:
             await upsert_news(new_items)
-        _d.news_store.extend(new_items)
+        state.news_store.extend(new_items)
 
-        logger.info("Total news items: %d (filtered from %d)", len(_d.news_store), len(all_raw))
+        logger.info("Total news items: %d (filtered from %d)", len(state.news_store), len(all_raw))
 
-    _d.article_store = await load_articles()
-    _d.publish_log = await load_publish_log()
+    state.article_store.extend(await load_articles())
+    state.publish_log.extend(await load_publish_log())
 
-    _d.schedule_running = SCHEDULE_ENABLED
-    if _d.schedule_running:
+    state.schedule_running = SCHEDULE_ENABLED
+    if state.schedule_running:
         logger.info(
             "Schedule enabled: NewsNow every %ds, RSS every %ds",
-            _d.newsnow_interval,
-            _d.rss_interval,
+            state.newsnow_interval,
+            state.rss_interval,
         )
         from api.schedule import _newsnow_crawl_loop, _rss_crawl_loop
 
