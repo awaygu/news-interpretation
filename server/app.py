@@ -47,6 +47,9 @@ from db import Database
 from di.container import AppContainer
 from di.state import AppState
 from repositories.news import NewsRepository
+from services.news import NewsService
+from sources import DEFAULT_RSS_FEEDS, NewsNowBatchCrawler, RSSBatchCrawler
+from sources.filter import KeywordFilter
 from sources.newsnow import FALLBACK_API_URL, check_newsnow_health
 
 logging.basicConfig(level=logging.DEBUG)
@@ -83,11 +86,23 @@ async def lifespan(app: FastAPI):
 
     state = AppState()
     news_repo = NewsRepository(database)
+    keyword_filter = KeywordFilter(settings.keywords_file) if settings.keywords_filter_enabled else KeywordFilter(None)
+    newsnow_batch = NewsNowBatchCrawler()
+    rss_batch = RSSBatchCrawler(DEFAULT_RSS_FEEDS)
+    news_service = NewsService(
+        state=state,
+        database=database,
+        news_repo=news_repo,
+        newsnow_batch=newsnow_batch,
+        rss_batch=rss_batch,
+        keyword_filter=keyword_filter,
+    )
     container = AppContainer(
         settings=settings,
         database=database,
         state=state,
         news_repo=news_repo,
+        news_service=news_service,
     )
 
     app.state.settings = settings

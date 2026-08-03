@@ -14,6 +14,7 @@ from config import Settings
 from db import Database
 from di.state import AppState
 from repositories.news import NewsRepository
+from services.news import NewsService
 
 
 @dataclass
@@ -24,6 +25,7 @@ class AppContainer:
     database: Database
     state: AppState
     news_repo: NewsRepository
+    news_service: NewsService
 
     # Compatibility accessors mirror old ``deps.py`` names.
     @property

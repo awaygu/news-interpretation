@@ -11,6 +11,7 @@ from db import Database
 from di.container import AppContainer
 from di.state import AppState
 from repositories.news import NewsRepository
+from services.news import NewsService
 
 
 def get_app(request: Request) -> Any:
@@ -45,6 +46,11 @@ def get_app_state(request: Request) -> AppState:
 def get_news_repository(request: Request) -> NewsRepository:
     """Return the news repository."""
     return request.app.state.container.news_repo
+
+
+def get_news_service(request: Request) -> NewsService:
+    """Return the news domain service."""
+    return request.app.state.container.news_service
 
 
 __all__ = [

@@ -32,6 +32,7 @@ from fastapi.testclient import TestClient
 import api.deps as deps
 import app as app_module
 import database as db
+from sources import NewsNowBatchCrawler, RSSBatchCrawler
 
 
 async def _true(*args, **kwargs) -> bool:
@@ -62,6 +63,12 @@ async def client(monkeypatch, tmp_path) -> TestClient:
 
     # Avoid any real network calls during lifespan / startup.
     monkeypatch.setattr(app_module, "check_newsnow_health", _true)
+    # Patch the classes themselves so any instance constructed by ``app.py``
+    # (the news service builds its own crawlers) returns empty results.
+    monkeypatch.setattr(NewsNowBatchCrawler, "crawl_all", _empty_dict)
+    monkeypatch.setattr(RSSBatchCrawler, "crawl_all", _empty_dict)
+    # Keep the legacy module-level instances patched for any code still
+    # referencing ``deps.newsnow_batch``/``deps.rss_batch``.
     monkeypatch.setattr(deps.newsnow_batch, "crawl_all", _empty_dict)
     monkeypatch.setattr(deps.rss_batch, "crawl_all", _empty_dict)
 
