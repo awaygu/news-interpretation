@@ -10,6 +10,8 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+from database import save_article
+
 from . import deps
 
 logger = logging.getLogger(__name__)
@@ -45,7 +47,7 @@ def _check_limited_items(items: list[dict]) -> list[str]:
 
 @router.post("/interpret")
 async def interpret_news(req: InterpretRequest):
-    item = deps.find_news(req.news_id)
+    item = await deps.find_news(req.news_id)
     if not item:
         raise HTTPException(404, f"News not found: {req.news_id}")
 
@@ -60,7 +62,7 @@ async def interpret_news(req: InterpretRequest):
 
 @router.post("/chat")
 async def chat_interpret(req: ChatRequest):
-    items = deps.find_news_batch(req.news_ids)
+    items = await deps.find_news_batch(req.news_ids)
     for item in items:
         await deps.ensure_content(item)
 
@@ -74,7 +76,7 @@ async def chat_interpret(req: ChatRequest):
 
 @router.post("/generate_article")
 async def generate_article(req: GenerateArticleRequest):
-    items = deps.find_news_batch(req.news_ids)
+    items = await deps.find_news_batch(req.news_ids)
     if not items:
         raise HTTPException(400, "No valid news items found for given IDs")
 
@@ -89,16 +91,17 @@ async def generate_article(req: GenerateArticleRequest):
     article = await deps.interpreter.generate_article(items, style, req.title, prompt=req.prompt)
     article["article_id"] = f"art_{uuid4().hex[:12]}"
 
-    async with deps.article_lock:
-        deps.article_store.append(article)
-        await deps.save_article(article)
+    # save_article 是 INSERT OR REPLACE，article_id 为 uuid4 无冲突，无需锁。
+    # 先落库（DB 事实来源），再回填缓存（append 即同步缓存）。
+    await save_article(article)
+    deps.article_store.append(article)
 
     return article
 
 
 @router.post("/interpret/stream")
 async def interpret_news_stream(req: InterpretRequest):
-    item = deps.find_news(req.news_id)
+    item = await deps.find_news(req.news_id)
     if not item:
         raise HTTPException(404, f"News not found: {req.news_id}")
 
@@ -126,7 +129,7 @@ async def interpret_news_stream(req: InterpretRequest):
 
 @router.post("/chat/stream")
 async def chat_interpret_stream(req: ChatRequest):
-    items = deps.find_news_batch(req.news_ids)
+    items = await deps.find_news_batch(req.news_ids)
 
     async def event_stream():
         if items:
@@ -153,7 +156,7 @@ async def chat_interpret_stream(req: ChatRequest):
 
 @router.post("/generate_article/stream")
 async def generate_article_stream(req: GenerateArticleRequest):
-    items = deps.find_news_batch(req.news_ids)
+    items = await deps.find_news_batch(req.news_ids)
     if not items:
         raise HTTPException(400, "No valid news items found for given IDs")
 
@@ -208,9 +211,10 @@ async def generate_article_stream(req: GenerateArticleRequest):
             "style": style.value,
             "news_ids": [n.get("news_id") for n in items],
         }
-        async with deps.article_lock:
-            deps.article_store.append(article)
-            await deps.save_article(article)
+        # save_article 是 INSERT OR REPLACE，article_id 为 uuid4 无冲突，无需锁。
+        # 先落库（DB 事实来源），再回填缓存（append 即同步缓存）。
+        await save_article(article)
+        deps.article_store.append(article)
 
         done = json.dumps({"type": "done", "article_id": article_id}, ensure_ascii=False)
         yield f"data: {done}\n\n"

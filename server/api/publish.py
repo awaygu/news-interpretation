@@ -8,16 +8,17 @@ import logging
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
+from database import list_articles, list_publish_log, save_publish_record
 from publishers import BrowserPublisher, DouyinPublisher, WechatMpPublisher, XiaohongshuPublisher
 from publishers.wechat_mp import WECHAT_IP_WHITELIST_ERROR, WechatApiError
 
 from . import deps
+from .errors import bad_request, not_found, unknown_platform
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api", tags=["publish"])
 
-_running_publish_tasks: set[asyncio.Task] = set()
 _publish_locks: dict[str, asyncio.Lock] = {}
 
 
@@ -25,6 +26,20 @@ def _get_lock(platform: str) -> asyncio.Lock:
     if platform not in _publish_locks:
         _publish_locks[platform] = asyncio.Lock()
     return _publish_locks[platform]
+
+
+def _already_running(platform: str) -> HTTPException:
+    """构造 429 并发冲突异常（带 Retry-After 提示客户端稍后重试）。
+
+    errors.py 没有提供 429 helper（发布并发守卫是 publish 路由特有语义），
+    故在本地构造 HTTPException；统一信封由 app.py 注册的全局
+    exception_handler 自动加 code/type，headers 也一并透传。
+    """
+    return HTTPException(
+        status_code=429,
+        detail=f"A task is already running for {platform}",
+        headers={"Retry-After": "5"},
+    )
 
 
 def _init_publishers():
@@ -59,40 +74,40 @@ async def publish_article(req: PublishRequest):
 
     publisher = deps.PUBLISHERS.get(req.platform)
     if not publisher:
-        raise HTTPException(
-            400,
-            f"Unknown platform: {req.platform}. Available: {list(deps.PUBLISHERS.keys())}",
-        )
+        raise unknown_platform(req.platform, available=list(deps.PUBLISHERS.keys()))
 
     title = req.title
     content = req.content
 
     if req.article_id and (not title or not content):
-        article = deps.find_article(req.article_id)
+        article = await deps.find_article(req.article_id)
         if not article:
-            raise HTTPException(404, f"Article not found: {req.article_id}")
+            raise not_found(f"Article not found: {req.article_id}")
         title = title or article.get("title", "")
         content = content or article.get("content", "")
 
     if not title or not content:
-        raise HTTPException(400, "title and content are required (either directly or via article_id)")
+        raise bad_request("title and content are required (either directly or via article_id)")
 
     clean_title = title[:40] if title else "文章"
     task = await task_manager.create_task("publish", req.platform, clean_title)
 
-    task_ref = asyncio.create_task(
-        _safe_run_publish_task(
-            task=task,
-            publisher=publisher,
-            title=title,
-            content=content,
-            article_id=req.article_id or "",
-            generate_cover=req.generate_cover,
-            generate_inline_images=req.generate_inline_images,
+    # 经 TaskManager 登记发布任务句柄：统一收口，shutdown 时可 await
+    # （_safe_run_publish_task 已捕获异常并标记失败，register_short 的
+    # done_callback 不会重复记录已处理的异常）。
+    task_manager.register_short(
+        asyncio.create_task(
+            _safe_run_publish_task(
+                task=task,
+                publisher=publisher,
+                title=title,
+                content=content,
+                article_id=req.article_id or "",
+                generate_cover=req.generate_cover,
+                generate_inline_images=req.generate_inline_images,
+            )
         )
     )
-    _running_publish_tasks.add(task_ref)
-    task_ref.add_done_callback(_running_publish_tasks.discard)
 
     return {"task_id": task.task_id, "status": "pending"}
 
@@ -160,9 +175,10 @@ async def _run_publish_task(
         "extra": result.extra,
     }
 
-    async with deps.article_lock:
-        deps.publish_log.append(record)
-        await deps.save_publish_record(record)
+    # publish_log 写走纯 DB：save_publish_record 是单条 INSERT，SQLite WAL 下并发安全，
+    # 不再借用 article_lock。先落库（事实来源），再失效缓存。
+    await save_publish_record(record)
+    deps.invalidate_publish_log()
 
     if result.success:
         await task_manager.update_task(
@@ -186,11 +202,13 @@ async def _run_publish_task(
 async def login_platform(platform: str):
     publisher = deps.PUBLISHERS.get(platform)
     if not publisher:
-        raise HTTPException(400, f"Unknown platform: {platform}")
+        raise unknown_platform(platform, available=list(deps.PUBLISHERS.keys()))
 
     lock = _get_lock(platform)
+    # 单 asyncio 事件循环下，locked() 检查与下方 `async with lock` 之间无 await，
+    # 不构成 TOCTOU；此快速检查仅用于乐观早退返回 429，真正互斥仍由 `async with lock` 保证。
     if lock.locked():
-        raise HTTPException(429, f"A task is already running for {platform}")
+        raise _already_running(platform)
 
     error_message = ""
     login_exc = None
@@ -222,7 +240,7 @@ async def login_platform(platform: str):
 async def login_status(platform: str):
     publisher = deps.PUBLISHERS.get(platform)
     if not publisher:
-        raise HTTPException(400, f"Unknown platform: {platform}")
+        raise unknown_platform(platform, available=list(deps.PUBLISHERS.keys()))
 
     error_message = ""
     status_exc = None
@@ -252,9 +270,9 @@ async def get_publish_log(
     offset: int = Query(default=0, ge=0),
     limit: int = Query(default=20, ge=1, le=100),
 ):
-    sorted_log = sorted(deps.publish_log, key=lambda r: r.get("timestamp", ""), reverse=True)
-    total = len(sorted_log)
-    return {"total": total, "offset": offset, "limit": limit, "items": sorted_log[offset : offset + limit]}
+    # DB 为事实来源：列表直接走 DB 分页查询（ORDER BY id DESC）。
+    items, total = await list_publish_log(offset=offset, limit=limit)
+    return {"total": total, "offset": offset, "limit": limit, "items": items}
 
 
 @router.get("/articles")
@@ -262,6 +280,7 @@ async def get_articles(
     offset: int = Query(default=0, ge=0),
     limit: int = Query(default=20, ge=1, le=100),
 ):
-    sorted_articles = sorted(deps.article_store, key=lambda a: a.get("article_id", ""), reverse=True)
-    total = len(sorted_articles)
-    return {"total": total, "offset": offset, "limit": limit, "items": sorted_articles[offset : offset + limit]}
+    # DB 为事实来源：列表直接走 DB 分页查询（ORDER BY created_at DESC，
+    # 替代原内存版按 article_id 排序，统一为时间倒序）。
+    items, total = await list_articles(offset=offset, limit=limit)
+    return {"total": total, "offset": offset, "limit": limit, "items": items}

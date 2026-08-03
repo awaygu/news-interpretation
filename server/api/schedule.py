@@ -10,8 +10,10 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from config import SCHEDULE_ENABLED, SCHEDULE_MIN_INTERVAL
+from database import news_id_exists_batch, upsert_news
 
 from . import deps
+from . import schedule_state as _sch
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/schedule", tags=["schedule"])
@@ -39,14 +41,14 @@ async def _newsnow_crawl_loop():
                 all_items.extend(items)
                 logger.info("  [Schedule] NewsNow-%s: %d items", pid, len(items))
             filtered = deps.kw_filter.filter_newsitems(all_items)
-            new_items: list = []
-            for item in filtered:
-                d = item.to_dict()
-                if not any(n["news_id"] == d["news_id"] for n in deps.news_store):
-                    deps.news_store.append(d)
-                    new_items.append(d)
+            # DB 查重：拿已存在 news_id 集合，未存在的才新增。DB 查询天然原子，
+            # 修复原 schedule 循环无锁 any() 去重的竞态。先落库再回填缓存。
+            candidates = [item.to_dict() for item in filtered]
+            existing = await news_id_exists_batch([d["news_id"] for d in candidates])
+            new_items = [d for d in candidates if d["news_id"] not in existing]
             if new_items:
-                await deps.upsert_news(new_items)
+                await upsert_news(new_items)
+                deps.news_store.extend(new_items)
                 logger.info("[Schedule] NewsNow: %d new items saved (filtered from %d)", len(new_items), len(all_items))
             deps.last_newsnow_crawl = datetime.now().isoformat()
         except Exception as e:
@@ -66,14 +68,13 @@ async def _rss_crawl_loop():
                 all_items.extend(items)
                 logger.info("  [Schedule] RSS-%s: %d items", feed_id, len(items))
             filtered = deps.kw_filter.filter_newsitems(all_items)
-            new_items: list = []
-            for item in filtered:
-                d = item.to_dict()
-                if not any(n["news_id"] == d["news_id"] for n in deps.news_store):
-                    deps.news_store.append(d)
-                    new_items.append(d)
+            # DB 查重：拿已存在 news_id 集合，未存在的才新增。先落库再回填缓存。
+            candidates = [item.to_dict() for item in filtered]
+            existing = await news_id_exists_batch([d["news_id"] for d in candidates])
+            new_items = [d for d in candidates if d["news_id"] not in existing]
             if new_items:
-                await deps.upsert_news(new_items)
+                await upsert_news(new_items)
+                deps.news_store.extend(new_items)
                 logger.info("[Schedule] RSS: %d new items saved (filtered from %d)", len(new_items), len(all_items))
             deps.last_rss_crawl = datetime.now().isoformat()
         except Exception as e:
@@ -94,13 +95,33 @@ async def get_schedule_status():
 
 @router.post("/toggle")
 async def toggle_schedule(req: ToggleScheduleRequest):
-    if req.enabled and not deps.schedule_running:
-        deps.schedule_running = True
-        asyncio.create_task(_newsnow_crawl_loop())
-        asyncio.create_task(_rss_crawl_loop())
+    # 直接写源模块 schedule_state，与 app.py lifespan 一致：写 deps 只会
+    # shadow 在 deps.__dict__，不回写源模块，会导致 toggle→lifespan 跨路径
+    # 防重复失效。读取仍走 deps.schedule_running（__getattr__ 转发到源模块）。
+    from .tasks import task_manager
+
+    if (
+        req.enabled
+        and not task_manager.is_running("newsnow_crawl_loop")
+        and not task_manager.is_running("rss_crawl_loop")
+    ):
+        # 防重复升级为"循环句柄存在性判断"：已登记的循环不重复派发。
+        # 仍写 schedule_running=True 作为循环退出条件（while deps.schedule_running）。
+        _sch.schedule_running = True
+        task_manager.register_background(
+            "newsnow_crawl_loop",
+            asyncio.create_task(_newsnow_crawl_loop()),
+        )
+        task_manager.register_background(
+            "rss_crawl_loop",
+            asyncio.create_task(_rss_crawl_loop()),
+        )
         logger.info("Schedule started by API")
     elif not req.enabled and deps.schedule_running:
-        deps.schedule_running = False
+        # 禁用：置标志位 + cancel 两个循环并 await 退出。
+        _sch.schedule_running = False
+        await task_manager.stop_background("newsnow_crawl_loop")
+        await task_manager.stop_background("rss_crawl_loop")
         logger.info("Schedule stopped by API")
     return {
         "running": deps.schedule_running,

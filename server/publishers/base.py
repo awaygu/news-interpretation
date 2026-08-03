@@ -13,7 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from config import COOKIES_DIR, PUBLISH_HEADLESS, PUBLISH_TIMEOUT
+from config import COOKIES_DIR, PUBLISH_TIMEOUT
 
 logger = logging.getLogger(__name__)
 
@@ -225,6 +225,49 @@ class BrowserPublisher(BasePublisher):
                     _run_playwright,
                     self._publish_impl(cookies, title, content, **kwargs),
                 )
+            except NeedLoginError:
+                # cookie 已过期：弹窗重新扫码登录，成功后用新 cookie 重跑一次发布。
+                await self._progress(f"{self.platform_name}登录已过期，正在打开浏览器窗口，请重新扫码登录...")
+                login_success = await self.do_login()
+                if not login_success:
+                    return PublishResult(
+                        success=False,
+                        platform=self.platform_name,
+                        article_title=title,
+                        need_login=True,
+                        error_message=self._last_login_error or "登录失败或超时，请重试",
+                    )
+                cookies = self.load_cookies()
+                if not cookies:
+                    return PublishResult(
+                        success=False,
+                        platform=self.platform_name,
+                        article_title=title,
+                        need_login=True,
+                        error_message="登录成功但无法读取 cookies，请重试",
+                    )
+                await self._progress(f"{self.platform_name}重新登录成功，继续发布...")
+                try:
+                    return await asyncio.to_thread(
+                        _run_playwright,
+                        self._publish_impl(cookies, title, content, **kwargs),
+                    )
+                except NeedLoginError as e2:
+                    return PublishResult(
+                        success=False,
+                        platform=self.platform_name,
+                        article_title=title,
+                        need_login=True,
+                        error_message=str(e2),
+                    )
+                except Exception as e2:
+                    logger.error("Publish retry failed for %s: %s", self.platform_name, e2)
+                    return PublishResult(
+                        success=False,
+                        platform=self.platform_name,
+                        article_title=title,
+                        error_message=f"Browser error: {e2}",
+                    )
             except Exception as e:
                 return PublishResult(
                     success=False,
@@ -237,8 +280,9 @@ class BrowserPublisher(BasePublisher):
         from playwright.async_api import async_playwright
 
         async with async_playwright() as pw:
-            headless = PUBLISH_HEADLESS
-            browser = await pw.chromium.launch(headless=headless)
+            # 发布为半自动流程：填好表单后等用户在浏览器窗口手动点「发布」，
+            # 故必须以有头模式启动，否则用户看不到窗口、无法手动发布。
+            browser = await pw.chromium.launch(headless=False)
             context = await browser.new_context(storage_state=cookies)
             page = await context.new_page()
 
@@ -249,15 +293,9 @@ class BrowserPublisher(BasePublisher):
                 self.save_cookies(storage_state)
 
                 return result
-            except NeedLoginError as e:
-                return PublishResult(
-                    success=False,
-                    platform=self.platform_name,
-                    article_title=title,
-                    need_login=True,
-                    error_message=str(e),
-                )
             except Exception as e:
+                if isinstance(e, NeedLoginError):
+                    raise  # 冒泡到 publish() 统一重新登录
                 logger.error("Publish failed for %s: %s", self.platform_name, e)
                 return PublishResult(
                     success=False,
