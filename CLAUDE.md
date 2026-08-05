@@ -56,7 +56,7 @@ docker compose -f docker-compose.newsnow.yml up -d   # 仅单独启动 NewsNow �
 - `config.py` — 所有可调参数（LLM、爬取间隔、嵌入维度、温度、记忆触发 token 数）。在这里集中修改，不要散落常量。
 - `api/` — 按领域拆分的 FastAPI 路由：`agent`（LangGraph agent 对话 + 工具调用）、`knowledge`（知识库 CRUD、上传、RAG 对话/生成）、`news`、`interpret`、`publish`、`schedule`、`keywords`、`prompts`（热重载）、`tasks`（异步任务 SSE）、`conversations`。**`api/deps.py` 是共享状态中枢**——内存中的 `news_store`/`article_store`/`publish_log`、爬虫注册表、锁、`interpreter` 单例、发布器实例、内容抓取辅助函数。路由统一从 `deps` 导入以避免循环依赖。
 - `core/` — AI 编排。`agent_graph.py`（通过 `create_agent` + `SummarizationMiddleware` + `AsyncSqliteSaver` 构建 LangGraph agent）、`rag_graph.py`（知识库 RAG StateGraph：`rewrite_query → classify_query → retrieve → generate`）、`interpreter.py`（新闻解读/文章生成）、`style_manager.py`（`PromptManager` 封装 `prompts.py`，支持热重载）、`image_generator.py`（DashScope qwen-image）、`checkpointer.py`（`agent_memory.db` 中的自定义 `conversations`/`messages` 表）。
-- `rag/` — `embeddings`（DashScope text-embedding-v4）、`vectorstore`（按知识库分库的 FAISS 索引）、`bm25_index`（jieba 分词的 BM25）、`chunker`、`loader`（PDF/DOCX/TXT/MD/图片 OCR）。检索采用向量 + BM25 命中的 **RRF 融合**。
+- `rag/` — `embeddings`（DashScope text-embedding-v4）、`vectorstore`（按知识库分库的 FAISS 索引）、`bm25_index`（jieba 分词的 BM25）、`reranker`（DashScope gte-rerank 精排，可关闭）、`chunker`、`loader`（PDF/DOCX/TXT/MD/图片 OCR）。检索采用向量 + BM25 命中的 **RRF 融合**，随后可选 **rerank 精排**（`KB_RERANK_ENABLED`，失败回退 RRF）。
 - `sources/` — `newsnow.py`（爬取 NewsNow 实例，从本地 Docker URL 失败时回退到公共实例）、`rss.py`、`filter.py`（关键词过滤）。
 - `publishers/` — 基于 Playwright 的浏览器自动化。`base.py` 定义 `BasePublisher`/`BrowserPublisher` 和 `PublishResult`。实现：`xiaohongshu.py`、`wechat_mp.py`（公众号草稿箱 API，非 Playwright）、`douyin_pub.py`。`image_archive.py` 缓存生成的图片。
 - `database.py` — SQLite（`news_ai.db`，aiosqlite，WAL 模式），存储 news/articles/publish_log/知识库表。Schema 迁移使用 try/except 守护的幂等 `ALTER TABLE ... ADD COLUMN`。
@@ -71,7 +71,7 @@ docker compose -f docker-compose.newsnow.yml up -d   # 仅单独启动 NewsNow �
 
 ### 两套 LangGraph 系统（切勿混淆）
 1. **Agent**（`core/agent_graph.py`）— `create_agent` + 9+ 工具（刷新/搜索/对比/知识库搜索/联网搜索/生成/解读）。状态通过 `AsyncSqliteSaver` 持久化，`thread_id` = 会话 id。SSE 事件：`conversation_id`、`prompt`、`loading`、`chunk`、`action`、`error`、`[DONE]`。
-2. **知识库 RAG**（`core/rag_graph.py`）— 手写 StateGraph，含查询重写（规则前置过滤 → 仅在命中代词/短句时调用 LLM）、意图分类（specific vs. summary，基于规则）、RRF 检索、生成。使用自行实现的 `SummarizationMiddleware`（非 LangChain 自带），以及独立的 `rag_memory.db` checkpointer。仅持久化 `Human`/`AIMessage`——检索到的 context 不入库。
+2. **知识库 RAG**（`core/rag_graph.py`）— 手写 StateGraph，含查询重写（规则前置过滤 → 仅在命中代词/短句时调用 LLM）、意图分类（specific vs. summary，基于规则）、RRF 检索 + rerank 精排（`KB_RERANK_ENABLED`，失败回退 RRF）、生成。使用自行实现的 `SummarizationMiddleware`（非 LangChain 自带），以及独立的 `rag_memory.db` checkpointer。仅持久化 `Human`/`AIMessage`——检索到的 context 不入库。
 
 ### 约定
 - 所有面向用户的字符串和提示词均为中文；注释中英文混用。修改文件时请与该文件已有语言保持一致。

@@ -124,6 +124,9 @@ class KnowledgeBaseSettings(BaseSettings):
     MAX_UPLOAD_SIZE: int = Field(20 * 1024 * 1024, alias="MAX_UPLOAD_SIZE")
     KB_EMBEDDING_DIM: int = Field(1024, alias="KB_EMBEDDING_DIM")
     KB_EMBEDDING_MODEL: str = Field("text-embedding-v4", alias="KB_EMBEDDING_MODEL")
+    # Rerank 精排：RRF 融合后用 DashScope gte-rerank 重排候选 chunk，失败回退 RRF
+    KB_RERANK_ENABLED: bool = Field(True, alias="KB_RERANK_ENABLED")
+    KB_RERANK_MODEL: str = Field("gte-rerank-v2", alias="KB_RERANK_MODEL")
     KB_VISION_MODEL: str = Field("qwen-vl-ocr-latest", alias="KB_VISION_MODEL")
     KB_VISION_BASE_URL: str = Field(
         "https://dashscope.aliyuncs.com/compatible-mode/v1",
@@ -349,6 +352,8 @@ UPLOAD_DIR = settings.knowledge_base.UPLOAD_DIR
 MAX_UPLOAD_SIZE = settings.knowledge_base.MAX_UPLOAD_SIZE
 KB_EMBEDDING_DIM = settings.knowledge_base.KB_EMBEDDING_DIM
 KB_EMBEDDING_MODEL = settings.knowledge_base.KB_EMBEDDING_MODEL
+KB_RERANK_ENABLED = settings.knowledge_base.KB_RERANK_ENABLED
+KB_RERANK_MODEL = settings.knowledge_base.KB_RERANK_MODEL
 KB_VISION_MODEL = settings.knowledge_base.KB_VISION_MODEL
 KB_VISION_BASE_URL = settings.knowledge_base.KB_VISION_BASE_URL
 KB_DB_POOL_SIZE = settings.knowledge_base.KB_DB_POOL_SIZE

@@ -274,6 +274,41 @@ def _rrf_fuse(
     return sorted(scores.items(), key=lambda x: x[1], reverse=True)
 
 
+async def _rerank_or_fallback(
+    query: str,
+    ids: list[str],
+    chunk_data: dict,
+    fused: list[tuple[str, float]],
+    max_chunks: int,
+) -> list[tuple[str, float]]:
+    """rerank 精排 ids（按 chunk_data 中的文本与 query 相关性打分）。
+
+    关闭（KB_RERANK_ENABLED=false）或缺少 API key 时，以及 rerank 调用任何
+    异常时，回退到 RRF 融合分数排序，取前 max_chunks，行为与无 rerank 时一致。
+    返回 (chunk_id, score) 列表，score 在 rerank 路径为 relevance_score、回退路径为 rrf 分数。
+    """
+    from config import DASHSCOPE_API_KEY, KB_RERANK_ENABLED
+
+    rrf_map = {cid: sc for cid, sc in fused}
+    rrf_ordered = [(cid, rrf_map[cid]) for cid in ids if cid in rrf_map][:max_chunks]
+
+    if not KB_RERANK_ENABLED or not DASHSCOPE_API_KEY or not ids:
+        return rrf_ordered
+
+    try:
+        from rag.reranker import DashScopeReranker
+
+        docs = [chunk_data[cid]["text"] for cid in ids]
+        results = await DashScopeReranker().rerank(query, docs, top_n=max_chunks)
+        if not results:
+            raise RuntimeError("empty rerank result")
+        logger.info("Rerank succeeded: %d candidates → top %d", len(ids), len(results))
+        return [(ids[idx], score) for idx, score in results]
+    except Exception as e:
+        logger.warning("Rerank failed, fallback to RRF: %s", e)
+        return rrf_ordered
+
+
 async def retrieve(state: dict) -> dict:
     from config import KB_EMBEDDING_DIM
     from database import load_kb_chunk_texts, load_kb_docs
@@ -327,15 +362,19 @@ async def retrieve(state: dict) -> dict:
     budget = MAX_RAG_CONTEXT_CHARS - meta_reserve
     # 每个 chunk 上下文开销 ≈ 来源头 50 + 文本平均 300 + 分隔 2 = 350
     max_chunks = max(budget // 350, 5)
-    chunk_ids = [cid for cid, _ in fused[:max_chunks]]
 
-    chunk_data = await load_kb_chunk_texts(chunk_ids)
+    # 候选池取 RRF 融合后的全部 chunk（≤ 2*top_k），rerank 精排后按相关性取前 max_chunks
+    candidate_ids = [cid for cid, _ in fused]
+    chunk_data = await load_kb_chunk_texts(candidate_ids)
 
-    filtered = [(cid, rrf_score) for cid, rrf_score in fused if cid in chunk_data]
+    # 过滤掉 DB 中查不到文本的 chunk_id，再交给 rerank 精排（失败回退 RRF）
+    filtered_ids = [cid for cid in candidate_ids if cid in chunk_data]
+
+    ranked = await _rerank_or_fallback(rewritten_query, filtered_ids, chunk_data, fused, max_chunks)
 
     context_parts = []
     sources = []
-    for idx, (cid, rrf_score) in enumerate(filtered, start=1):
+    for idx, (cid, score) in enumerate(ranked, start=1):
         cd = chunk_data[cid]
         page_info = f", 第{cd['page']}页" if cd.get("page", 0) > 0 else ""
         context_parts.append(f"[来源{idx}: {cd['filename']}{page_info}]\n{cd['text']}")
@@ -343,7 +382,7 @@ async def retrieve(state: dict) -> dict:
             {
                 "filename": cd["filename"],
                 "page": cd.get("page", 0),
-                "score": round(rrf_score, 4),
+                "score": round(score, 4),
                 "text": cd["text"],
                 "preview": cd["text"][:80] + ("..." if len(cd["text"]) > 80 else ""),
             }
